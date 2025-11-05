@@ -31,11 +31,25 @@ const (
 	// CleanupDelayAfterStart specifies the delay before starting cleanup after manager initialization (1 minute).
 	CleanupDelayAfterStart = 1 * time.Minute
 
+	// PeriodicCleanupInterval defines how often to perform periodic cleanup (1 hour).
+	PeriodicCleanupInterval = 1 * time.Hour
+
 	// OrphanFileCleanupThreshold defines when orphaned files should be cleaned up (10 minutes).
 	OrphanFileCleanupThreshold = 10 * time.Minute
 
+	// UnusedFileCleanupThreshold defines when unused files should be cleaned up (24 hours).
+	// Files that haven't been accessed for this duration will be cleaned up.
+	UnusedFileCleanupThreshold = 24 * time.Hour
+
 	// MaxCacheEntries defines the maximum number of files to keep in the cache to prevent memory leaks.
 	MaxCacheEntries = 10000 // Reasonable limit for most use cases
+
+	// MaxDiskUsageGB defines the maximum disk usage in GB before aggressive cleanup (50 GB).
+	// When exceeded, older files will be cleaned up more aggressively.
+	MaxDiskUsageGB = 50
+
+	// AggressiveCleanupThreshold defines when to aggressively clean up files when disk usage is high (12 hours).
+	AggressiveCleanupThreshold = 12 * time.Hour
 )
 
 // Manager instances per instanceID for proper isolation.
@@ -289,9 +303,10 @@ func newManager(instanceID string) *FileCopyManager {
 	fm.buildFileIndex()
 
 	// Start managed goroutines with proper lifecycle
-	fm.wg.Add(2)
+	fm.wg.Add(3)
 	go fm.asyncDeletionWorker()
 	go fm.scheduleDelayedCleanup()
+	go fm.schedulePeriodicCleanup()
 
 	return fm
 }
@@ -445,6 +460,25 @@ func (fm *FileCopyManager) scheduleDelayedCleanup() {
 	}
 }
 
+// schedulePeriodicCleanup performs periodic cleanup at regular intervals.
+// This ensures files are cleaned up even during long-running sessions.
+func (fm *FileCopyManager) schedulePeriodicCleanup() {
+	defer fm.wg.Done()
+
+	ticker := time.NewTicker(PeriodicCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-fm.ctx.Done():
+			return // Context cancelled, exit
+		case <-ticker.C:
+			// Perform periodic cleanup
+			fm.performPeriodicCleanup()
+		}
+	}
+}
+
 // performInitialCleanup removes files that haven't been accessed since manager creation.
 // This implements the 1-minute delay cleanup strategy for unused files.
 func (fm *FileCopyManager) performInitialCleanup() {
@@ -467,6 +501,157 @@ func (fm *FileCopyManager) performInitialCleanup() {
 
 	// Also clean up orphaned files on disk for this instance
 	fm.cleanupOrphanedFilesInternal()
+}
+
+// performPeriodicCleanup performs regular cleanup of unused files and checks disk usage.
+func (fm *FileCopyManager) performPeriodicCleanup() {
+	// Check disk usage first
+	diskUsageGB := fm.getDiskUsageGB()
+	aggressive := diskUsageGB > MaxDiskUsageGB
+
+	threshold := UnusedFileCleanupThreshold
+	if aggressive {
+		threshold = AggressiveCleanupThreshold
+	}
+
+	now := time.Now()
+	cleanedCount := 0
+
+	// Clean up files that haven't been accessed for the threshold duration
+	fm.fileIndex.Range(func(key, value any) bool {
+		entry := value.(*FileIndexEntry)
+		lastAccess := entry.GetLastAccess()
+		timeSinceAccess := now.Sub(lastAccess)
+
+		if timeSinceAccess > threshold {
+			// Queue for async deletion and remove from index
+			select {
+			case fm.deletionChan <- entry.TempPath:
+				fm.fileIndex.Delete(key)
+				atomic.AddInt64(&fm.cacheSize, -1)
+				cleanedCount++
+			default:
+				// Deletion channel is full, delete synchronously
+				os.Remove(entry.TempPath)
+				fm.fileIndex.Delete(key)
+				atomic.AddInt64(&fm.cacheSize, -1)
+				cleanedCount++
+			}
+		}
+		return true
+	})
+
+	// Also clean up orphaned files
+	fm.cleanupOrphanedFilesInternal()
+
+	// If disk usage is still high, perform more aggressive cleanup
+	if aggressive && diskUsageGB > MaxDiskUsageGB {
+		fm.performAggressiveCleanup()
+	}
+
+	// Trigger cache cleanup if needed
+	if atomic.LoadInt64(&fm.cacheSize) > MaxCacheEntries {
+		go fm.performCacheCleanup()
+	}
+}
+
+// performAggressiveCleanup performs aggressive cleanup when disk usage is high.
+// This cleans up files that haven't been accessed recently, regardless of threshold.
+func (fm *FileCopyManager) performAggressiveCleanup() {
+	// Collect all entries sorted by last access time
+	type cacheEntry struct {
+		key        string
+		lastAccess int64
+		entry      *FileIndexEntry
+		size       int64
+	}
+
+	var entries []cacheEntry
+	fm.fileIndex.Range(func(key, value any) bool {
+		entry := value.(*FileIndexEntry)
+		entries = append(entries, cacheEntry{
+			key:        key.(string),
+			lastAccess: atomic.LoadInt64(&entry.lastAccess),
+			entry:      entry,
+			size:       entry.Size,
+		})
+		return true
+	})
+
+	// Sort by last access time (oldest first)
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].lastAccess < entries[j].lastAccess
+	})
+
+	// Remove oldest 50% of entries
+	removeCount := len(entries) / 2
+	if removeCount < 1 {
+		removeCount = 1
+	}
+
+	for i := 0; i < removeCount && i < len(entries); i++ {
+		entry := entries[i]
+		fm.fileIndex.Delete(entry.key)
+		atomic.AddInt64(&fm.cacheSize, -1)
+
+		select {
+		case fm.deletionChan <- entry.entry.TempPath:
+		default:
+			os.Remove(entry.entry.TempPath)
+		}
+	}
+}
+
+// getDiskUsageGB calculates the total disk usage of temporary files in GB.
+func (fm *FileCopyManager) getDiskUsageGB() float64 {
+	var totalSize int64
+	fm.fileIndex.Range(func(key, value any) bool {
+		entry := value.(*FileIndexEntry)
+		totalSize += entry.Size
+		return true
+	})
+	return float64(totalSize) / (1024 * 1024 * 1024) // Convert to GB
+}
+
+// cleanupOldVersions cleans up old versions of the same file (same baseName, ext, pathHash but different dataHash).
+// This prevents accumulation of multiple versions when the source file changes frequently.
+func (fm *FileCopyManager) cleanupOldVersions(baseName, ext, pathHash, currentDataHash string) {
+	versionKey := fm.generateVersionKey(fm.instanceID, baseName, ext, pathHash)
+
+	// Find all entries with the same version key (same file, different versions)
+	var oldVersions []*FileIndexEntry
+	fm.fileIndex.Range(func(key, value any) bool {
+		entry := value.(*FileIndexEntry)
+		// Check if this entry matches the version key (same baseName, ext, pathHash)
+		entryVersionKey := fm.generateVersionKey(fm.instanceID, entry.BaseName, extractFileExtension(entry.TempPath), entry.PathHash)
+		if entryVersionKey == versionKey && entry.DataHash != currentDataHash {
+			oldVersions = append(oldVersions, entry)
+		}
+		return true
+	})
+
+	// Clean up old versions (keep only the most recent one)
+	if len(oldVersions) > 0 {
+		// Sort by last access time, keep the most recent
+		sort.Slice(oldVersions, func(i, j int) bool {
+			return atomic.LoadInt64(&oldVersions[i].lastAccess) > atomic.LoadInt64(&oldVersions[j].lastAccess)
+		})
+
+		// Delete all but the most recent version
+		for i := 1; i < len(oldVersions); i++ {
+			entry := oldVersions[i]
+			// Find the cache key for this entry
+			cacheKey := fm.generateCacheKey(fm.instanceID, entry.BaseName, extractFileExtension(entry.TempPath), entry.PathHash, entry.DataHash)
+			fm.fileIndex.Delete(cacheKey)
+			atomic.AddInt64(&fm.cacheSize, -1)
+
+			select {
+			case fm.deletionChan <- entry.TempPath:
+			default:
+				os.Remove(entry.TempPath)
+			}
+		}
+	}
 }
 
 // performCacheCleanup removes least recently used cache entries when cache size exceeds limit
@@ -637,6 +822,9 @@ func (fm *FileCopyManager) GetTempCopy(originalPath string) (string, error) {
 
 	// Strategy 2: No valid cached file found, create new one
 	tempPath := fm.generateTempPath(originalPath)
+
+	// Before creating new copy, clean up old versions of the same file
+	fm.cleanupOldVersions(baseName, ext, currentHash, expectedDataHash)
 
 	// Perform atomic file copy
 	if err := fm.atomicCopyFile(originalPath, tempPath); err != nil {
@@ -844,19 +1032,36 @@ func (fm *FileCopyManager) Shutdown() {
 	// Cancel context to signal goroutines to stop
 	fm.cancel()
 
-	// Remove all cached temporary files asynchronously
+	// Perform final cleanup before shutdown
+	// Clean up files that haven't been accessed recently (more than 1 hour)
+	now := time.Now()
+	finalCleanupThreshold := 1 * time.Hour
+
 	fm.fileIndex.Range(func(key, value any) bool {
 		entry := value.(*FileIndexEntry)
-		select {
-		case fm.deletionChan <- entry.TempPath:
-		default:
-			// Channel full, delete synchronously as fallback
-			os.Remove(entry.TempPath)
+		lastAccess := entry.GetLastAccess()
+		timeSinceAccess := now.Sub(lastAccess)
+
+		// Keep only very recently accessed files (within 1 hour)
+		if timeSinceAccess > finalCleanupThreshold {
+			select {
+			case fm.deletionChan <- entry.TempPath:
+				fm.fileIndex.Delete(key)
+				atomic.AddInt64(&fm.cacheSize, -1)
+			default:
+				// Channel full, delete synchronously as fallback
+				os.Remove(entry.TempPath)
+				fm.fileIndex.Delete(key)
+				atomic.AddInt64(&fm.cacheSize, -1)
+			}
 		}
 		return true
 	})
 
-	// Clear all entries from sync.Map
+	// Clean up orphaned files one more time
+	fm.cleanupOrphanedFilesInternal()
+
+	// Clear all remaining entries from sync.Map
 	fm.fileIndex.Range(func(key, value any) bool {
 		fm.fileIndex.Delete(key)
 		atomic.AddInt64(&fm.cacheSize, -1)
