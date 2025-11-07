@@ -43,6 +43,7 @@ _聊天记录工具，帮助大家轻松使用自己的聊天数据_，将chatlo
 - **Windows 用户**：遇到界面显示问题请[使用 Windows Terminal](#windows-版本说明)
 - **集成 AI 助手**：查看 [MCP 集成指南](#mcp-集成)
 - **无法获取密钥**：查看 [FAQ](https://github.com/sjzar/chatlog/issues/197)
+- **临时文件占用空间过大**：Windows 系统会在 `%TEMP%\filecopy_main` 目录创建数据库副本，可能占用大量空间，请参考[临时文件清理说明](#临时文件清理)
 
 ## 安装指南
 
@@ -53,6 +54,7 @@ go install github.com/sjzar/chatlog@latest
 ```
 
 > 💡 **提示**: 部分功能有 cgo 依赖，编译前需确认本地有 C 编译环境。
+> ⚠️ **注意**: go-sqlite3 必须在 `CGO_ENABLED=1` 时编译才能正常工作。请安装对应平台的 C 编译器（Windows 建议安装 MinGW-w64 并设置 `CC`；macOS 需安装 Xcode Command Line Tools；Linux 需安装 gcc/clang），然后执行 `CGO_ENABLED=1 go build ./cmd/chatlog` 或按需配置环境。
 
 ### 下载预编译版本
 
@@ -173,6 +175,50 @@ macOS 用户在获取密钥前需要临时关闭 SIP（系统完整性保护）�
 3. **获取密钥后**：可以重新启用 SIP（`csrutil enable`），不影响后续使用
 
 > Apple Silicon 用户注意：确保微信、chatlog 和终端都不在 Rosetta 模式下运行
+
+### 临时文件清理
+
+Windows 系统上，程序会在 `%TEMP%\filecopy_main` 目录创建数据库文件的临时副本（因为 SQLite 在 Windows 上无法直接读取正在使用的数据库文件）。
+
+#### 自动清理机制（已改进）
+
+程序现在具备**自动清理机制**，无需手动干预：
+
+- ✅ **定期清理**：每小时自动清理 24 小时未访问的文件
+- ✅ **磁盘空间控制**：当占用超过 50GB 时，自动清理到 25GB 以下
+- ✅ **版本管理**：创建新副本时自动清理旧版本
+- ✅ **退出清理**：程序退出时清理 1 小时未访问的文件
+
+#### 手动清理（如需要）
+
+如果发现空间占用仍然较大，可以手动清理：
+
+1. **使用清理脚本**（推荐）：
+   ```powershell
+   # 预览模式，查看将删除的文件
+   .\scripts\cleanup_temp_files.ps1 -WhatIf -DaysOld 7
+   
+   # 清理7天前的文件
+   .\scripts\cleanup_temp_files.ps1 -DaysOld 7
+   ```
+
+2. **手动清理**：
+   ```powershell
+   # 清理7天前的文件（先关闭 chatlog 程序）
+   Get-Process | Where-Object {$_.ProcessName -like "*chatlog*"} | Stop-Process
+   Start-Sleep -Seconds 3
+   $cutoffDate = (Get-Date).AddDays(-7)
+   Get-ChildItem "C:\Users\$env:USERNAME\AppData\Local\Temp\filecopy_main" -File | 
+       Where-Object { $_.LastWriteTime -lt $cutoffDate } | 
+       Remove-Item -Force
+   ```
+
+> 💡 **提示**：正常情况下，程序会自动管理临时文件，空间占用会保持在 50GB 以下。如果遇到 "Device or resource busy" 错误，说明文件正在被使用，需要先关闭程序。
+
+详细说明请参考：
+- [临时文件分析报告](docs/temp_file_analysis.md)
+- [彻底解决方案](docs/solution_summary.md)
+- [清理指南](docs/cleanup_guide.md)
 
 ## HTTP API
 
@@ -321,6 +367,7 @@ Chatlog 可以与多种支持 MCP 的 AI 助手集成，包括：
 为了帮助大家更好地利用 Chatlog 与 AI 助手，我们整理了一些 prompt 示例。希望这些 prompt 可以启发大家更有效地查询和分析聊天记录，获取更精准的信息。
 
 查看 [Prompt 指南](docs/prompt.md) 获取详细示例。
+开启图片 CDN 上传前请阅读 [OSS 配置指南](docs/oss.md)。
 
 同时欢迎大家分享使用经验和 prompt！如果您有好的 prompt 示例或使用技巧，请通过 [Discussions](https://github.com/sjzar/chatlog/discussions) 进行分享，共同进步。
 
