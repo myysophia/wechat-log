@@ -56,7 +56,7 @@ var Groups = []*dbm.Group{
 	},
 	{
 		Name:      Voice,
-		Pattern:   `^MediaMSG([0-9]?[0-9])?\.db$`,
+		Pattern:   `^MediaMSG([0-9]*)\.db$`,
 		BlackList: []string{},
 	},
 }
@@ -735,7 +735,7 @@ func (ds *DataSource) GetVoice(ctx context.Context, key string) (*model.Media, e
 	query := `
 	SELECT Buf
 	FROM Media
-	WHERE Reserved0 = ? 
+	WHERE Reserved0 = ?
 	`
 	args := []interface{}{key}
 
@@ -744,10 +744,20 @@ func (ds *DataSource) GetVoice(ctx context.Context, key string) (*model.Media, e
 		return nil, errors.DBConnectFailed("", err)
 	}
 
-	for _, db := range dbs {
+	var lastError error
+	for i, db := range dbs {
 		rows, err := db.QueryContext(ctx, query, args...)
 		if err != nil {
-			return nil, errors.QueryFailed(query, err)
+			// 区分错误类型：如果是"no such table: Media"错误，继续尝试下一个数据库
+			if strings.Contains(err.Error(), "no such table: Media") {
+				log.Warn().Err(err).Str("key", key).Int("db_index", i).Msg("当前数据库没有Media表，尝试下一个数据库")
+				lastError = err
+				continue
+			}
+			// 其他错误也记录并继续
+			log.Warn().Err(err).Str("key", key).Int("db_index", i).Msg("查询数据库失败，尝试下一个数据库")
+			lastError = err
+			continue
 		}
 		defer rows.Close()
 
@@ -757,9 +767,12 @@ func (ds *DataSource) GetVoice(ctx context.Context, key string) (*model.Media, e
 				&voiceData,
 			)
 			if err != nil {
-				return nil, errors.ScanRowFailed(err)
+				log.Warn().Err(err).Str("key", key).Int("db_index", i).Msg("扫描数据失败，尝试下一个数据库")
+				lastError = err
+				break
 			}
 			if len(voiceData) > 0 {
+				log.Info().Str("key", key).Int("db_index", i).Int("voice_data_size", len(voiceData)).Msg("成功获取语音数据 (Windows V3)")
 				return &model.Media{
 					Type: "voice",
 					Key:  key,
@@ -769,6 +782,10 @@ func (ds *DataSource) GetVoice(ctx context.Context, key string) (*model.Media, e
 		}
 	}
 
+	// 如果有错误信息，返回最后一个错误；否则返回未找到错误
+	if lastError != nil {
+		return nil, lastError
+	}
 	return nil, errors.ErrMediaNotFound
 }
 

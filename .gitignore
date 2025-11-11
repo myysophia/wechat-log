@@ -29,3 +29,5 @@ go.work.sum
 
 chatlog.exe# Added by goreleaser init:
 dist/
+
+personal_doc
